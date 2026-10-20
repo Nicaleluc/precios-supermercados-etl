@@ -126,6 +126,13 @@ py -u -m cli.cargar_sepa --auto                              # baja el ZIP del d
 py -u -m cli.cargar_sepa --zip .\sepa_martes.zip --max-grupos 2 --limite 500
 ```
 
+**Chequear si un precio es "normal" (referencia SEPA):**
+
+```bash
+py -u -m cli.chequear_precio --ean 7798338291803
+py -u -m cli.chequear_precio --ean 7798338291803 --precio 3190
+```
+
 **Comparar una lista de compras:**
 
 ```bash
@@ -238,6 +245,7 @@ Credenciales y rutas: solo en `.env` (nunca se commitea; ver `.env.template`).
 | `D_CompraDetalle` | `DetalleId` | ítem, cantidad, unidad, precio unitario, subtotal, EAN, categoría |
 | `D_CompraProductoRef` | `(Item, Cadena)` | fija el SKU exacto por ítem/cadena (y override `$/kg`) |
 | `V_CompraPrecioBarato` | vista | ítems comprados × Coope/Vea/Carrefour/La Banderita + más barato |
+| `V_PrecioNormal` | vista | por EAN: precio normal (mediana SEPA), min/max, referencia, promos |
 
 DDL idempotente en `etl/dominios/precios/schema.py` y en `sql/` (001-004);
 se crea solo en la primera carga.
@@ -254,9 +262,34 @@ anidada: `<fecha>/sepa_*_comercio-sepa-*.zip` → `comercio.csv`, `sucursales.cs
 
 Validado con el ZIP real de 2026-10-13 (`INC S.A.` = Carrefour).
 
+Carga **bulk** (staging + MERGE set-based) para los ~12 M de filas/día: los CSV
+se vuelcan a tablas temporales con `fast_executemany` y se hacen `MERGE`/`INSERT`
+de conjuntos. `precio_lista` → `Precio`; `precio_referencia` → `PrecioLista`.
+
 ```bash
 py -u -m cli.cargar_sepa --auto                 # baja el ZIP del día y lo carga
 py -u -m cli.cargar_sepa --zip ... --max-grupos 2 --limite 500   # prueba
+```
+
+## Precio normal (SEPA)
+
+`V_PrecioNormal` calcula, por EAN, el **precio normal** como la **mediana entre
+sucursales** del SEPA, más mínimo, máximo, referencia y cantidad de promos.
+`cli.chequear_precio` compara un precio (o los precios cargados de cada cadena)
+contra ese normal:
+
+```bash
+py -u -m cli.chequear_precio --ean 7798338291803
+```
+
+```
+EAN 7798338291803  LECHE C PROTEINA VIDA ACTIVA LAS TRES NINAS X 1LT
+  SEPA: normal $3.119 (mediana de 6 sucursales; min $2.999 / max $3.275; promos 0)
+  Cordiez              $2.269  (-27.3% vs normal)  barato
+  Cooperativa Obrera   $2.290  (-26.6% vs normal)  barato
+  Carrefour            $3.119  (  0.0% vs normal)  normal
+  DIA                  $3.120  (  0.0% vs normal)  normal
+  Vea                  $3.190  ( +2.3% vs normal)  normal
 ```
 
 ## Comparador cruzado
@@ -312,6 +345,7 @@ cli/comparar.py                   # comparador (base por defecto; --vivo, --ean,
 cli/cargar_sucursales.py          # sucursales a D_PrecioSucursal
 cli/cargar_sepa.py                # SEPA (--auto / --zip)
 cli/registrar_compra.py           # registra compras (D_Compra/Detalle)
+cli/chequear_precio.py            # compara un precio contra el normal de SEPA
 config/settings.py                # lee .env (SQL_*, HTTP_*, cadenas)
 etl/conn/db.py                    # pyodbc + SQLAlchemy (ODBC Driver 18, Windows Auth)
 etl/conn/vtex.py                  # cliente VTEX (búsqueda, EAN, categorías)
@@ -334,6 +368,7 @@ sql/002_compras.sql                       # compras (cabecera/detalle)
 sql/003_vista_compras.sql                 # vista V_CompraPrecioBarato
 sql/004_ref_productos.sql                 # refs de SKU por ítem/cadena
 sql/005_migrar_datos.sql                  # migración desde otra base (opcional)
+sql/006_precio_normal.sql                 # vista V_PrecioNormal
 sql/consulta_productos.sql                # cuadro por EAN/nombre
 tests/                            # transform, matching, integración (DB se salta si no hay)
 ```

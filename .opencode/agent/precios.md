@@ -72,13 +72,15 @@ programar_diario.bat              # solo la diaria
 cli/importar_precios.py           # extract + flags (--catalogo, --ean-ficha)
 cli/comparar.py                   # comparador (base por defecto; --vivo, --ean, --producto)
 cli/cargar_sucursales.py          # carga D_PrecioSucursal (BB + localidades Coope)
-cli/cargar_sepa.py                # carga CSV de SEPA (pendiente validar)
+cli/cargar_sepa.py                # SEPA (--auto / --zip; bulk staging)
+cli/registrar_compra.py           # registra compras (D_Compra/Detalle)
+cli/chequear_precio.py            # compara un precio contra el normal de SEPA
 config/settings.py                # lee .env: SQL_*, USER_AGENT, HTTP_*, CADENAS, POR_PAGINA, MAX_PAGINAS
 etl/conn/db.py                    # pyodbc + SQLAlchemy (ODBC Driver 18, Windows Auth)
 etl/conn/vtex.py                  # VtexClient: buscar_termino/por_ean/categorias_arbol
 etl/conn/coope.py                 # CoopeClient: buscar(), detalle(), localidades() (envelope estado=1)
 etl/conn/la_banderita.py          # LaBanderitaClient: buscar() (scraper HTML, paginado + EAN)
-etl/conn/sepa.py                  # lector de CSV de SEPA (streaming, header-driven)
+etl/conn/sepa.py                  # SEPA bulk (staging + MERGE set-based)
 etl/dominios/precios/constants.py # CADENAS (registro) + TERMINOS_DEFAULT
 etl/dominios/precios/modelos.py   # Producto(cadena, sku_id, ...) / Oferta(producto, precio, ...)
 etl/dominios/precios/categorias.py# categoría canónica entre cadenas (canonica())
@@ -111,6 +113,7 @@ py -u -m cli.comparar --cadena vea leche pan
 py -u -m cli.cargar_sucursales           # sucursales (BB + localidades Coope)
 py -u -m cli.importar_precios --catalogo # TODO el catálogo (VTEX/Coope/Banderita)
 py -u -m cli.cargar_sepa --auto          # SEPA del día (precio por sucursal)
+py -u -m cli.chequear_precio --ean 7798338291803   # ¿precio normal? (vs mediana SEPA)
 py -u -m cli.comparar leche yerba        # compara sobre la base
 py -u -m cli.comparar --ean 7793913013474
 py -u -m cli.comparar --producto "Leche entera 1 litro"   # equivalentes fuzzy

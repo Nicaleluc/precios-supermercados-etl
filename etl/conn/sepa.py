@@ -1,6 +1,6 @@
-"""Lector de los archivos oficiales de **SEPA** (Precios Claros).
+"""Lector de los archivos oficiales de **SEPA** (Precios Claros) — versión BULK.
 
-Estructura real (verificada 2026-10-13):
+Estructura real:
   outer.zip
     <fecha>/sepa_<n>_comercio-sepa-<m>_<fecha>.zip   (ZIPs anidados)
         comercio.csv      id_comercio|id_bandera|...|comercio_bandera_nombre|...
@@ -8,16 +8,18 @@ Estructura real (verificada 2026-10-13):
                           sucursales_calle|...|sucursales_localidad|sucursales_provincia
         productos.csv     id_comercio|id_bandera|id_sucursal|id_producto(=EAN)|
                           productos_ean(flag)|productos_descripcion|productos_marca|
-                          productos_precio_lista|...|productos_leyenda_promo1|...
+                          productos_precio_lista|productos_precio_referencia|
+                          productos_leyenda_promo1|...
 
 Delimitador `|`, UTF-8 con BOM.
-  * comercio.csv   -> `D_PrecioCadena` (id_comercio+id_bandera -> nombre de bandera)
-  * sucursales.csv -> `D_PrecioSucursal` (id_comercio+id_sucursal = local)
-  * productos.csv  -> `D_PrecioProducto` + `D_PrecioOferta` (precio POR SUCURSAL)
 
-Las ofertas (el volumen, millones) se cargan en **bulk** con `fast_executemany`;
-antes se borran las filas SEPA de esa fecha (idempotente). `limite`/`max_grupos`
-sirven para validar sin cargar todo.
+Carga MASIVA (para los ~12 M de filas/día):
+  1. Se leen los CSV y se vuelcan a tablas temporales (`#StgSuc`, `#StgProd`)
+     con `fast_executemany`.
+  2. Se hacen **MERGE set-based** a Cadena/Sucursal/Producto.
+  3. Se borran las ofertas SEPA de la fecha y se hace `INSERT ... SELECT` masivo.
+
+`precio_lista` -> `Precio`; `precio_referencia` -> `PrecioLista` (precio "normal").
 """
 from __future__ import annotations
 
@@ -30,30 +32,15 @@ from pathlib import Path
 
 from etl.conn.db import get_connection
 
-from etl.dominios.precios.modelos import Producto
-from etl.dominios.precios.repository import (
-    upsert_cadena,
-    upsert_producto,
-    upsert_sucursal,
-)
-
 
 class SepaError(RuntimeError):
     """Falla al leer/mapear los archivos de SEPA."""
 
 
 _RE_FECHA = re.compile(r"(\d{4}-\d{2}-\d{2})")
-_INSERT_OFERTA = """
-INSERT INTO dbo.D_PrecioOferta
-    (ProductoId, SucursalId, Fecha, Precio, PrecioLista, PrecioSinImp,
-     PrecioUnitario, EnPromo, DescripcionPromo, PromoDesde, PromoHasta,
-     DescuentoPorc, Stock, Moneda, Disponible, Origen)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-"""
 
 _PROVINCIAS = {
-    "AR-C": "Ciudad Autónoma de Buenos Aires",
-    "AR-B": "Buenos Aires",
+    "AR-C": "Ciudad Autónoma de Buenos Aires", "AR-B": "Buenos Aires",
     "AR-K": "Catamarca", "AR-H": "Chaco", "AR-U": "Chubut", "AR-X": "Córdoba",
     "AR-W": "Corrientes", "AR-E": "Entre Ríos", "AR-P": "Formosa", "AR-Y": "Jujuy",
     "AR-L": "La Pampa", "AR-F": "La Rioja", "AR-M": "Mendoza", "AR-N": "Misiones",
@@ -62,9 +49,118 @@ _PROVINCIAS = {
     "AR-G": "Santiago del Estero", "AR-V": "Tierra del Fuego", "AR-T": "Tucumán",
 }
 
+_DDL_STG_SUC = """
+CREATE TABLE #StgSuc (
+    CadenaCodigo varchar(80)  NOT NULL,
+    CadenaNombre nvarchar(200) NOT NULL,
+    SucCodigo    varchar(80)  NOT NULL,
+    SucNombre    nvarchar(150) NULL,
+    SucDireccion nvarchar(200) NULL,
+    SucLocalidad nvarchar(100) NULL,
+    SucProvincia nvarchar(60)  NULL,
+    SucCP        varchar(12)   NULL,
+    SucLat       decimal(9,6)  NULL,
+    SucLng       decimal(9,6)  NULL
+);
+"""
+_DDL_STG_PROD = """
+CREATE TABLE #StgProd (
+    CadenaCodigo varchar(80)  NOT NULL,
+    SucCodigo    varchar(80)  NOT NULL,
+    Sku          varchar(40)  NOT NULL,
+    Ean          varchar(14)  NULL,
+    Nombre       nvarchar(300) NOT NULL,
+    Marca        nvarchar(120) NULL,
+    Precio       decimal(18,2) NOT NULL,
+    PrecioRef    decimal(18,2) NULL,
+    EnPromo      bit           NOT NULL,
+    LeyendaPromo nvarchar(200) NULL,
+    Fecha        date          NOT NULL
+);
+"""
+_INSERT_STG_SUC = (
+    "INSERT INTO #StgSuc (CadenaCodigo, CadenaNombre, SucCodigo, SucNombre, "
+    "SucDireccion, SucLocalidad, SucProvincia, SucCP, SucLat, SucLng) "
+    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+)
+_INSERT_STG_PROD = (
+    "INSERT INTO #StgProd (CadenaCodigo, SucCodigo, Sku, Ean, Nombre, Marca, "
+    "Precio, PrecioRef, EnPromo, LeyendaPromo, Fecha) "
+    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+)
+
+_MERGE_CADENA = """
+MERGE dbo.D_PrecioCadena AS t
+USING (SELECT DISTINCT CadenaCodigo, CadenaNombre FROM #StgSuc) AS s
+   ON t.Codigo = s.CadenaCodigo
+WHEN MATCHED THEN UPDATE SET t.Nombre = s.CadenaNombre, t.Plataforma = 'SEPA'
+WHEN NOT MATCHED THEN INSERT (Codigo, Nombre, Plataforma)
+     VALUES (s.CadenaCodigo, s.CadenaNombre, 'SEPA');
+"""
+
+_MERGE_SUCURSAL = """
+MERGE dbo.D_PrecioSucursal AS t
+USING (
+    SELECT c.CadenaId, s.SucCodigo, s.SucNombre, s.SucDireccion, s.SucLocalidad,
+           s.SucProvincia, s.SucCP, s.SucLat, s.SucLng
+    FROM #StgSuc s JOIN dbo.D_PrecioCadena c ON c.Codigo = s.CadenaCodigo
+) AS s
+   ON t.CadenaId = s.CadenaId AND t.CodigoSucursal = s.SucCodigo
+WHEN MATCHED THEN
+    UPDATE SET t.Nombre = s.SucNombre, t.Direccion = s.SucDireccion,
+               t.Localidad = s.SucLocalidad, t.Provincia = s.SucProvincia,
+               t.CodigoPostal = s.SucCP, t.Latitud = s.SucLat,
+               t.Longitud = s.SucLng, t.CodigoSepa = s.SucCodigo
+WHEN NOT MATCHED THEN
+    INSERT (CadenaId, CodigoSucursal, Tipo, Nombre, Direccion, Localidad,
+            Provincia, CodigoPostal, Latitud, Longitud, CodigoSepa)
+    VALUES (s.CadenaId, s.SucCodigo, 'SUPER', s.SucNombre, s.SucDireccion,
+            s.SucLocalidad, s.SucProvincia, s.SucCP, s.SucLat, s.SucLng,
+            s.SucCodigo);
+"""
+
+_MERGE_PRODUCTO = """
+MERGE dbo.D_PrecioProducto AS t
+USING (
+    SELECT c.CadenaId, s.Sku, s.Ean, s.Nombre, s.Marca
+    FROM (SELECT DISTINCT CadenaCodigo, Sku, Ean, Nombre, Marca FROM #StgProd) s
+    JOIN dbo.D_PrecioCadena c ON c.Codigo = s.CadenaCodigo
+) AS s
+   ON t.CadenaId = s.CadenaId AND t.SkuId = s.Sku
+WHEN MATCHED THEN
+    UPDATE SET t.Ean = s.Ean, t.Nombre = s.Nombre, t.Marca = s.Marca,
+               t.UltimaVez = SYSDATETIME()
+WHEN NOT MATCHED THEN
+    INSERT (CadenaId, SkuId, Ean, Nombre, Marca)
+    VALUES (s.CadenaId, s.Sku, s.Ean, s.Nombre, s.Marca);
+"""
+
+_DELETE_OFERTAS = "DELETE FROM dbo.D_PrecioOferta WHERE Origen = 'SEPA' AND Fecha = ?"
+
+_INSERT_OFERTAS = """
+;WITH o AS (
+    SELECT p.ProductoId, su.SucursalId, s.Fecha, s.Precio, s.PrecioRef,
+           s.EnPromo, s.LeyendaPromo,
+           ROW_NUMBER() OVER (PARTITION BY p.ProductoId, su.SucursalId
+                              ORDER BY s.Precio) AS rn
+    FROM #StgProd s
+    JOIN dbo.D_PrecioCadena c   ON c.Codigo = s.CadenaCodigo
+    JOIN dbo.D_PrecioSucursal su ON su.CadenaId = c.CadenaId
+                                AND su.CodigoSucursal = s.SucCodigo
+    JOIN dbo.D_PrecioProducto p  ON p.CadenaId = c.CadenaId AND p.SkuId = s.Sku
+)
+INSERT INTO dbo.D_PrecioOferta
+    (ProductoId, SucursalId, Fecha, Precio, PrecioLista, EnPromo,
+     DescripcionPromo, Moneda, Disponible, Origen)
+SELECT ProductoId, SucursalId, Fecha, Precio, PrecioRef, EnPromo,
+       LeyendaPromo, 'ARS', 1, 'SEPA'
+FROM o WHERE rn = 1;
+"""
+
+_BATCH = 5000
+
 
 def _filas(zf: zipfile.ZipFile, nombre: str):
-    """Genera dicts de un CSV `|`-delimitado, UTF-8 con BOM."""
     try:
         fh = zf.open(nombre)
     except KeyError:
@@ -82,13 +178,16 @@ def _num(valor) -> float | None:
         return None
 
 
+def _es_id(valor) -> bool:
+    return str(valor or "").strip().isdigit()
+
+
 def _zip_inner(entrada: Path):
-    """Genera (nombre, bytes) de cada inner ZIP; o el propio archivo si es un inner."""
     if entrada.suffix.lower() != ".zip":
         raise SepaError(f"Esperaba un .zip: {entrada}")
     with zipfile.ZipFile(entrada) as z:
         inner = [n for n in z.namelist() if n.lower().endswith(".zip")]
-        if not inner:  # ya es un inner zip (tiene los CSV)
+        if not inner:
             yield entrada.name, entrada.read_bytes()
             return
         for n in inner:
@@ -97,154 +196,138 @@ def _zip_inner(entrada: Path):
                 yield n, data
 
 
-def _flush_ofertas(cur, filas) -> None:
+def _flush(cur, sql, filas) -> None:
     if not filas:
         return
     cur.fast_executemany = True
-    cur.executemany(_INSERT_OFERTA, filas)
+    cur.executemany(sql, filas)
     cur.fast_executemany = False
 
 
 def cargar_zip(cur, conn, entrada: Path, *, limite: int | None = None,
-               max_grupos: int | None = None, banderas=None,
-               fecha: date | None = None) -> dict:
+               max_grupos: int | None = None, fecha: date | None = None,
+               banderas=None) -> dict:
     stats = {"grupos": 0, "cadenas": 0, "sucursales": 0, "productos": 0, "precios": 0}
-    cache_cad: dict[tuple, int] = {}
-    cache_suc: dict[tuple, int] = {}
-    cache_prod: dict[tuple, int] = {}
+    cur.execute(_DDL_STG_SUC)
+    cur.execute(_DDL_STG_PROD)
     limpiadas: set[date] = set()
-    buffer: list[tuple] = []
+    cadenas_vistas: set[str] = set()
     restante = limite
 
-    def _es_id(valor) -> bool:
-        return str(valor or "").strip().isdigit()
+    for nombre, data in _zip_inner(entrada):
+        if max_grupos and stats["grupos"] >= max_grupos:
+            break
+        if not data:
+            continue
+        stats["grupos"] += 1
 
-    try:
-        for nombre, data in _zip_inner(entrada):
-            if max_grupos and stats["grupos"] >= max_grupos:
-                break
-            if not data:
-                continue
-            stats["grupos"] += 1
+        m = _RE_FECHA.search(nombre)
+        fecha_grupo = fecha or (date.fromisoformat(m.group(1)) if m else date.today())
+        if fecha_grupo not in limpiadas:
+            cur.execute(_DELETE_OFERTAS, (fecha_grupo,))
+            limpiadas.add(fecha_grupo)
 
-            m = _RE_FECHA.search(nombre)
-            fecha_grupo = fecha or (date.fromisoformat(m.group(1)) if m else date.today())
-            if fecha_grupo not in limpiadas:
-                cur.execute(
-                    "DELETE FROM dbo.D_PrecioOferta WHERE Origen = ? AND Fecha = ?",
-                    ("SEPA", fecha_grupo),
-                )
-                limpiadas.add(fecha_grupo)
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            nombres = {n.lower(): n for n in z.namelist()}
+            n_com = nombres.get("comercio.csv")
+            n_suc = nombres.get("sucursales.csv")
+            n_prod = nombres.get("productos.csv")
 
-            with zipfile.ZipFile(io.BytesIO(data)) as z:
-                nombres = {n.lower(): n for n in z.namelist()}
-                n_com = nombres.get("comercio.csv")
-                n_suc = nombres.get("sucursales.csv")
-                n_prod = nombres.get("productos.csv")
+            nombres_bandera: dict[tuple, str] = {}
+            if n_com:
+                for row in _filas(z, n_com):
+                    com = str(row.get("id_comercio") or "").strip()
+                    b = str(row.get("id_bandera") or "").strip()
+                    nom = (row.get("comercio_bandera_nombre") or "").strip()
+                    if _es_id(com) and _es_id(b) and nom:
+                        nombres_bandera.setdefault((com, b), nom)
 
-                nombres_bandera: dict[tuple, str] = {}
-                if n_com:
-                    for row in _filas(z, n_com):
-                        com = str(row.get("id_comercio") or "").strip()
-                        b = str(row.get("id_bandera") or "").strip()
-                        nom = (row.get("comercio_bandera_nombre") or "").strip()
-                        if _es_id(com) and _es_id(b) and nom:
-                            nombres_bandera.setdefault((com, b), nom)
+            def _cadena(com: str, b: str) -> tuple[str, str]:
+                cod = f"sepa_{com}_{b}"
+                cadenas_vistas.add(cod)
+                if banderas and b in banderas:
+                    return cod, banderas[b]
+                return cod, nombres_bandera.get((com, b)) or f"SEPA {com}-{b}"
 
-                def cadena_id(comercio: str, bandera: str) -> int:
-                    clave = (comercio, bandera)
-                    if clave in cache_cad:
-                        return cache_cad[clave]
-                    if banderas and bandera in banderas:
-                        nom = banderas[bandera]
-                    else:
-                        nom = nombres_bandera.get(clave) or f"SEPA {comercio}-{bandera}"
-                    cache_cad[clave] = upsert_cadena(
-                        cur, codigo=f"sepa_{comercio}_{bandera}", nombre=nom,
-                        plataforma="SEPA")
-                    stats["cadenas"] += 1
-                    return cache_cad[clave]
+            # 1) sucursales -> #StgSuc
+            cur.execute("TRUNCATE TABLE #StgSuc")
+            lote = []
+            for row in _filas(z, n_suc):
+                com = str(row.get("id_comercio") or "").strip()
+                b = str(row.get("id_bandera") or "").strip()
+                suc = str(row.get("id_sucursal") or "").strip()
+                if not (_es_id(com) and _es_id(suc)):
+                    continue
+                cod, nom = _cadena(com, b)
+                direccion = " ".join(filter(None, [
+                    (row.get("sucursales_calle") or "").strip(),
+                    (row.get("sucursales_numero") or "").strip()]))
+                prov = (row.get("sucursales_provincia") or "").strip()
+                lote.append((
+                    cod, nom, f"SEPA-{com}-{suc}",
+                    row.get("sucursales_nombre") or None, direccion or None,
+                    row.get("sucursales_localidad") or None,
+                    _PROVINCIAS.get(prov, prov) or None,
+                    row.get("sucursales_codigo_postal") or None,
+                    _num(row.get("sucursales_latitud")),
+                    _num(row.get("sucursales_longitud")),
+                ))
+                stats["sucursales"] += 1
+                if len(lote) >= _BATCH:
+                    _flush(cur, _INSERT_STG_SUC, lote)
+                    lote = []
+            _flush(cur, _INSERT_STG_SUC, lote)
 
-                if n_suc:
-                    for row in _filas(z, n_suc):
-                        com = str(row.get("id_comercio") or "").strip()
-                        b = str(row.get("id_bandera") or "").strip()
-                        suc = str(row.get("id_sucursal") or "").strip()
-                        if not (_es_id(com) and _es_id(suc)):
-                            continue
-                        cid = cadena_id(com, b)
-                        direccion = " ".join(filter(None, [
-                            (row.get("sucursales_calle") or "").strip(),
-                            (row.get("sucursales_numero") or "").strip()]))
-                        prov = (row.get("sucursales_provincia") or "").strip()
-                        sid = upsert_sucursal(
-                            cur, cadena_id=cid, codigo=f"SEPA-{com}-{suc}", tipo="SUPER",
-                            nombre=(row.get("sucursales_nombre") or None),
-                            direccion=(direccion or None),
-                            localidad=(row.get("sucursales_localidad") or None),
-                            provincia=(_PROVINCIAS.get(prov, prov) or None),
-                            codigo_postal=(row.get("sucursales_codigo_postal") or None),
-                            latitud=_num(row.get("sucursales_latitud")),
-                            longitud=_num(row.get("sucursales_longitud")),
-                            codigo_sepa=f"{com}-{suc}",
-                        )
-                        cache_suc[(com, suc)] = sid
-                        stats["sucursales"] += 1
+            # 2) productos/precios -> #StgProd
+            cur.execute("TRUNCATE TABLE #StgProd")
+            lote = []
+            for row in _filas(z, n_prod):
+                if restante is not None and restante <= 0:
+                    break
+                com = str(row.get("id_comercio") or "").strip()
+                b = str(row.get("id_bandera") or "").strip()
+                suc = str(row.get("id_sucursal") or "").strip()
+                if not (_es_id(com) and _es_id(suc)):
+                    continue
+                sku = str(row.get("id_producto") or "").strip()
+                if not sku:
+                    continue
+                precio = _num(row.get("productos_precio_lista"))
+                ref = _num(row.get("productos_precio_referencia"))
+                if precio is None:
+                    precio = ref
+                if precio is None:
+                    continue
+                ean = sku if sku.isdigit() and 8 <= len(sku) <= 14 else None
+                leyenda = (row.get("productos_leyenda_promo1") or "").strip()
+                cod, _ = _cadena(com, b)
+                lote.append((
+                    cod, f"SEPA-{com}-{suc}", sku, ean,
+                    row.get("productos_descripcion") or sku,
+                    row.get("productos_marca") or None,
+                    precio, ref, int(bool(leyenda)), leyenda or None, fecha_grupo,
+                ))
+                stats["productos"] += 1
+                stats["precios"] += 1
+                if len(lote) >= _BATCH:
+                    _flush(cur, _INSERT_STG_PROD, lote)
+                    lote = []
+                if restante is not None:
+                    restante -= 1
+            _flush(cur, _INSERT_STG_PROD, lote)
 
-                if n_prod:
-                    for row in _filas(z, n_prod):
-                        if restante is not None and restante <= 0:
-                            break
-                        com = str(row.get("id_comercio") or "").strip()
-                        suc = str(row.get("id_sucursal") or "").strip()
-                        b = str(row.get("id_bandera") or "").strip()
-                        if not (_es_id(com) and _es_id(suc)):
-                            continue
-                        id_prod = str(row.get("id_producto") or "").strip()
-                        if not id_prod:
-                            continue
-                        ean = id_prod if id_prod.isdigit() and 8 <= len(id_prod) <= 14 else None
-                        precio = _num(row.get("productos_precio_lista"))
-                        if precio is None:
-                            precio = _num(row.get("productos_precio_referencia"))
-                        if precio is None:
-                            continue
-                        par = cache_suc.get((com, suc))
-                        if par is None:
-                            continue
-                        cid = cadena_id(com, b)
-                        pkey = (cid, id_prod)
-                        if pkey not in cache_prod:
-                            prod = Producto(
-                                cadena=f"sepa_{com}_{b}", sku_id=id_prod,
-                                nombre=(row.get("productos_descripcion") or id_prod),
-                                ean=ean, marca=(row.get("productos_marca") or None),
-                            )
-                            cache_prod[pkey] = upsert_producto(cur, cid, prod)
-                            stats["productos"] += 1
-                        leyenda = (row.get("productos_leyenda_promo1") or "").strip()
-                        buffer.append((
-                            cache_prod[pkey], par, fecha_grupo, precio, None, None,
-                            None, int(bool(leyenda)), (leyenda or None), None, None,
-                            None, None, "ARS", 1, "SEPA",
-                        ))
-                        stats["precios"] += 1
-                        if len(buffer) >= 5000:
-                            _flush_ofertas(cur, buffer)
-                            buffer = []
-                        if restante is not None:
-                            restante -= 1
-            _flush_ofertas(cur, buffer)
-            buffer = []
+            # 3) MERGE set-based + ofertas masivas
+            cur.execute(_MERGE_CADENA)
+            cur.execute(_MERGE_SUCURSAL)
+            cur.execute(_MERGE_PRODUCTO)
+            cur.execute(_INSERT_OFERTAS)
             conn.commit()
-    finally:
-        _flush_ofertas(cur, buffer)
-        conn.commit()
+
+    stats["cadenas"] = len(cadenas_vistas)
     return stats
 
 
-def cargar(entrada, *, limite=None, max_grupos=None, banderas=None,
-           fecha=None, conn=None) -> dict:
+def cargar(entrada, *, limite=None, max_grupos=None, fecha=None, banderas=None, conn=None) -> dict:
     entrada = Path(entrada)
     if not entrada.is_file():
         raise SepaError(f"No existe: {entrada}")
@@ -252,8 +335,8 @@ def cargar(entrada, *, limite=None, max_grupos=None, banderas=None,
     conn = conn or get_connection()
     cur = conn.cursor()
     try:
-        stats = cargar_zip(cur, conn, entrada, limite=limite, max_grupos=max_grupos,
-                           banderas=banderas, fecha=fecha)
+        stats = cargar_zip(cur, conn, entrada, limite=limite,
+                           max_grupos=max_grupos, fecha=fecha, banderas=banderas)
         conn.commit()
         return stats
     finally:
