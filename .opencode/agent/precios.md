@@ -75,6 +75,7 @@ cli/cargar_sucursales.py          # carga D_PrecioSucursal (BB + localidades Coo
 cli/cargar_sepa.py                # SEPA (--auto / --zip; bulk staging)
 cli/registrar_compra.py           # registra compras (D_Compra/Detalle)
 cli/chequear_precio.py            # compara un precio contra el normal de SEPA
+cli/enriquecer_ean_coope.py       # mapea EAN -> cod_interno de la Coope
 config/settings.py                # lee .env: SQL_*, USER_AGENT, HTTP_*, CADENAS, POR_PAGINA, MAX_PAGINAS
 etl/conn/db.py                    # pyodbc + SQLAlchemy (ODBC Driver 18, Windows Auth)
 etl/conn/vtex.py                  # VtexClient: buscar_termino/por_ean/categorias_arbol
@@ -202,6 +203,8 @@ sucursal `ONLINE` de cada cadena; el precio por local usa la sucursal real.
   jerárquica, stock y gramaje; **no** expone EAN. Búsqueda paginada
   (`POST /api/articulos/pagina_busqueda`, 8/pág.); catálogo por categorías
   (`--catalogo`, usa los nombres del árbol como término).
+  El EAN no viene en la API; se completa con `cli.enriquecer_ean_coope`
+  (su autocomplete **sí busca por EAN** y devuelve el `cod_interno`).
 - **SEPA validado** (`etl/conn/sepa.py`): ZIP oficial anidado
   (`comercio.csv`/`sucursales.csv`/`productos.csv`, delimitado `|`). Da
   **precio por sucursal** + EAN (`id_producto`) + dirección/geo. Cadena =

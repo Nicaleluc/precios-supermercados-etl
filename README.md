@@ -133,6 +133,18 @@ py -u -m cli.chequear_precio --ean 7798338291803
 py -u -m cli.chequear_precio --ean 7798338291803 --precio 3190
 ```
 
+**Enriquecer EAN de la Coope (su API no lo expone):**
+
+```bash
+py -u -m cli.enriquecer_ean_coope --limite 50 --dry-run
+py -u -m cli.enriquecer_ean_coope
+```
+
+> La Coope no publica el EAN, pero su autocomplete **busca por EAN**. El CLI
+> toma los productos sin EAN, busca candidatos en VTEX/SEPA por similitud de
+> nombre y confirma consultando ese EAN en la Coope (si devuelve el mismo
+> `cod_interno`, setea el EAN).
+
 **Comparar una lista de compras:**
 
 ```bash
@@ -208,7 +220,7 @@ categoría, categoryId, EAN, unidad, imagen y precio al 100%).
 | `changomas` | Changomas (Más Online) | `www.masonline.com.ar` | ✅ VTEX |
 | `cordiez` | Cordiez | `www.cordiez.com.ar` | ✅ VTEX |
 | `dia` | DIA | `www.supermercadosdia.com.ar` | ✅ VTEX vía cuenta `diaio` (`api_host`) |
-| `cooperativa_obrera` | Cooperativa Obrera | `www.lacoopeencasa.coop` | ✅ API propia (búsqueda paginada + catálogo) |
+| `cooperativa_obrera` | Cooperativa Obrera | `www.lacoopeencasa.coop` | ✅ API propia (búsqueda paginada + catálogo; EAN por enriquecimiento) |
 | `la_banderita` | La Banderita (BB) | `www.labanderita.ar` | ✅ Scraper HTML (paginado + EAN + marcas) |
 | `makro` | Makro | — | ❌ No es VTEX (WordPress), sin API de productos |
 | `diarco`, `vital`, `la_anonima` | — | — | ⚠️ Sin API de precios usable (cubiertas por SEPA o scraping) |
@@ -346,6 +358,7 @@ cli/cargar_sucursales.py          # sucursales a D_PrecioSucursal
 cli/cargar_sepa.py                # SEPA (--auto / --zip)
 cli/registrar_compra.py           # registra compras (D_Compra/Detalle)
 cli/chequear_precio.py            # compara un precio contra el normal de SEPA
+cli/enriquecer_ean_coope.py       # mapea EAN -> cod_interno de la Coope
 config/settings.py                # lee .env (SQL_*, HTTP_*, cadenas)
 etl/conn/db.py                    # pyodbc + SQLAlchemy (ODBC Driver 18, Windows Auth)
 etl/conn/vtex.py                  # cliente VTEX (búsqueda, EAN, categorías)
